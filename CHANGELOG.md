@@ -7,6 +7,14 @@
 
 ## [Unreleased]
 
+### Reliability
+
+- **Cached models no longer retry HuggingFace when offline.** Loading a fully-downloaded
+  model now forces offline mode for the duration of the load, so it skips the network HEAD
+  request (and its 5-retry backoff) for every config file — `config.json`,
+  `generation_config.json`, and the rest — instead of retrying each one in sequence before the
+  app becomes ready.
+
 ### Linux
 
 - **ROCm setup works on Linux AMD systems.** Docker ROCm builds now keep PyTorch

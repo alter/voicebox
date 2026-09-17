@@ -14,6 +14,7 @@ from typing import Callable, List, Optional, Tuple
 import numpy as np
 
 from ..utils.audio import normalize_audio, load_audio
+from ..utils.hf_offline_patch import force_offline_if_cached
 from ..utils.progress import get_progress_manager
 from ..utils.hf_progress import HFProgressTracker, create_hf_progress_callback
 from ..utils.tasks import get_task_manager
@@ -280,7 +281,8 @@ def model_load_progress(
         )
 
     try:
-        yield tracker_context
+        with force_offline_if_cached(is_cached, model_name):
+            yield tracker_context
     except Exception as e:
         # Report error to both managers
         progress_manager.mark_error(model_name, str(e))
