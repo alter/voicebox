@@ -15,6 +15,7 @@ run this file serially.
 import os
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -111,6 +112,46 @@ def test_concurrent_threads_share_offline_window():
     assert not t_fast.is_alive(), "fast thread did not finish"
     assert not errors, errors
     assert observations == [True], "slow thread lost offline protection"
+    assert original == _hf_const().HF_HUB_OFFLINE
+
+
+def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load():
+    """An uncached (network-needing) load must never inherit the forced
+    offline mode of a concurrent, unrelated cached load — even when both
+    start at nearly the same time.
+    """
+    original = _hf_const().HF_HUB_OFFLINE
+    observations: list[bool] = []
+    errors: list[Exception] = []
+    cached_entered = threading.Event()
+
+    def cached_load():
+        try:
+            with force_offline_if_cached(True, "cached"):
+                cached_entered.set()
+                time.sleep(0.2)
+        except Exception as exc:
+            errors.append(exc)
+
+    def uncached_load():
+        try:
+            assert cached_entered.wait(timeout=5), "cached thread never entered"
+            with force_offline_if_cached(False, "uncached"):
+                observations.append(_hf_const().HF_HUB_OFFLINE)
+        except Exception as exc:
+            errors.append(exc)
+
+    t_cached = threading.Thread(target=cached_load)
+    t_uncached = threading.Thread(target=uncached_load)
+    t_cached.start()
+    t_uncached.start()
+    t_cached.join(timeout=5)
+    t_uncached.join(timeout=5)
+
+    assert not t_cached.is_alive(), "cached thread did not finish"
+    assert not t_uncached.is_alive(), "uncached thread did not finish"
+    assert not errors, errors
+    assert observations == [False], "uncached load observed offline mode forced by a concurrent cached load"
     assert original == _hf_const().HF_HUB_OFFLINE
 
 

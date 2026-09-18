@@ -22,9 +22,20 @@ logger = logging.getLogger(__name__)
 # ``transformers.utils.hub.is_offline_mode``) read the bools — not the env.
 # We mutate the cached constants directly, guarded by a refcount so
 # concurrent inference threads share a single offline window safely.
+#
+# That refcounted window is process-global, so an *uncached* load (which
+# needs real network access) must never run while it's open — it would
+# silently inherit HF_HUB_OFFLINE=True from an unrelated concurrent cached
+# load and fail to fetch what it needs. Symmetrically, a new offline window
+# must not open while an uncached load is in flight. Both directions wait on
+# a condition variable rather than a plain lock: holding a lock for an
+# entire model load (which can take minutes over the network) would also
+# serialize unrelated *cached* loads against each other, which sharing the
+# window is specifically meant to allow.
 
-_offline_lock = threading.RLock()
+_offline_cv = threading.Condition(threading.RLock())
 _offline_refcount = 0
+_uncached_active = 0
 _saved_env: Optional[str] = None
 _saved_hf_const: Optional[bool] = None
 _saved_transformers_const: Optional[bool] = None
@@ -40,19 +51,36 @@ def force_offline_if_cached(is_cached: bool, model_label: str = ""):
     so multiple concurrent inference threads share a single offline window
     and the last one to exit restores state.
 
-    If *is_cached* is ``False`` the block runs normally (network allowed).
+    If *is_cached* is ``False`` the block waits for any open offline window
+    to close first, then runs with network allowed — and blocks any new
+    offline window from opening until it's done, so it can never observe
+    (or be blamed for breaking) a concurrent cached load's forced-offline
+    state.
 
     Args:
         is_cached: Whether the model weights are already on disk.
         model_label: Human-readable name used in log messages.
     """
+    global _offline_refcount, _uncached_active
+    global _saved_env, _saved_hf_const, _saved_transformers_const
+
     if not is_cached:
-        yield
+        with _offline_cv:
+            while _offline_refcount > 0:
+                _offline_cv.wait()
+            _uncached_active += 1
+        try:
+            yield
+        finally:
+            with _offline_cv:
+                _uncached_active -= 1
+                _offline_cv.notify_all()
         return
 
-    global _offline_refcount, _saved_env, _saved_hf_const, _saved_transformers_const
+    with _offline_cv:
+        while _uncached_active > 0:
+            _offline_cv.wait()
 
-    with _offline_lock:
         if _offline_refcount == 0:
             # Snapshot prior state, apply new state, roll back on *any*
             # failure. Catching only ImportError here would let a partially
@@ -116,7 +144,7 @@ def force_offline_if_cached(is_cached: bool, model_label: str = ""):
     try:
         yield
     finally:
-        with _offline_lock:
+        with _offline_cv:
             _offline_refcount -= 1
             if _offline_refcount == 0:
                 if _saved_env is not None:
@@ -140,6 +168,7 @@ def force_offline_if_cached(is_cached: bool, model_label: str = ""):
                 _saved_env = None
                 _saved_hf_const = None
                 _saved_transformers_const = None
+            _offline_cv.notify_all()
 
 
 _mistral_regex_patched = False
