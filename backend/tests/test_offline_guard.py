@@ -155,5 +155,36 @@ def test_uncached_load_never_observes_offline_flag_from_concurrent_cached_load()
     assert original == _hf_const().HF_HUB_OFFLINE
 
 
+def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
+    """Nesting is_cached=True inside is_cached=False (or vice versa) on the
+    same thread must raise immediately, not hang: the inner call's wait
+    condition can only be cleared by the outer call's own exit, which can
+    never run because it's blocked inside the inner call waiting for it.
+
+    Runs in a background daemon thread with a bounded join so a regression
+    fails this test instead of hanging the whole suite.
+    """
+    result: dict = {}
+
+    def run():
+        try:
+            with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(True, "inner-cached"):
+                pass
+        except Exception as exc:
+            result["exc"] = exc
+        else:
+            result["exc"] = None
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout=3)
+
+    assert not t.is_alive(), (
+        "nesting the opposite mode on the same thread hung instead of raising -- "
+        "this is the deadlock the per-thread mode-stack guard exists to prevent"
+    )
+    assert isinstance(result.get("exc"), RuntimeError), result.get("exc")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
