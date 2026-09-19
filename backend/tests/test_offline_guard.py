@@ -12,6 +12,7 @@ parallelism (e.g. ``pytest-xdist`` with ``--dist=loadfile``/``loadscope``);
 run this file serially.
 """
 
+import multiprocessing
 import os
 import sys
 import threading
@@ -23,6 +24,27 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from utils.hf_offline_patch import force_offline_if_cached  # noqa: E402
+
+
+def _nest_opposite_modes_in_subprocess(queue):
+    """Module-level so it's picklable for multiprocessing's spawn start method.
+
+    Runs in a fresh child process rather than a thread of the test process,
+    so a real deadlock here (a regression of the guard this test exists for)
+    can't leave the shared _offline_cv state corrupted for every other test
+    in this run: the child either exits cleanly (guard raised) or gets
+    terminated by the parent after the timeout, and either way the test
+    process's own state was never touched.
+    """
+    try:
+        with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(
+            True, "inner-cached"
+        ):
+            pass
+    except Exception as exc:
+        queue.put(("exc", type(exc).__name__, str(exc)))
+    else:
+        queue.put(("ok", None, None))
 
 
 def _hf_const():
@@ -161,29 +183,31 @@ def test_nesting_opposite_mode_on_same_thread_raises_instead_of_deadlocking():
     condition can only be cleared by the outer call's own exit, which can
     never run because it's blocked inside the inner call waiting for it.
 
-    Runs in a background daemon thread with a bounded join so a regression
-    fails this test instead of hanging the whole suite.
+    Runs in a spawned child process with a bounded join, terminated if it's
+    still alive after the timeout, so a regression fails this test instead of
+    hanging the suite or leaving _offline_cv's shared state corrupted for
+    every other test in this run.
     """
-    result: dict = {}
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_nest_opposite_modes_in_subprocess, args=(queue,))
+    proc.start()
+    proc.join(timeout=5)
 
-    def run():
-        try:
-            with force_offline_if_cached(False, "outer-uncached"), force_offline_if_cached(True, "inner-cached"):
-                pass
-        except Exception as exc:
-            result["exc"] = exc
-        else:
-            result["exc"] = None
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=2)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=2)
+        pytest.fail(
+            "nesting the opposite mode on the same thread hung instead of raising, "
+            "this is the deadlock the per-thread mode-stack guard exists to prevent"
+        )
 
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout=3)
-
-    assert not t.is_alive(), (
-        "nesting the opposite mode on the same thread hung instead of raising -- "
-        "this is the deadlock the per-thread mode-stack guard exists to prevent"
-    )
-    assert isinstance(result.get("exc"), RuntimeError), result.get("exc")
+    kind, exc_type, exc_msg = queue.get(timeout=2)
+    assert kind == "exc", (kind, exc_type, exc_msg)
+    assert exc_type == "RuntimeError", (kind, exc_type, exc_msg)
 
 
 if __name__ == "__main__":
